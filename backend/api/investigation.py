@@ -1,5 +1,6 @@
-"""
+﻿"""
 TraceShield – Investigation API Routes
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 POST /api/investigation/create
 POST /api/investigation/analyze
 GET  /api/investigation/list
@@ -13,13 +14,13 @@ from pydantic import BaseModel
 from typing import Optional
 
 from backend.ai.investigator import analyze_investigation, extract_entities, classify_user_entity
-from backend.models.case_store import create_case, get_case, list_cases, update_case, add_activity
+from backend.models.case_store import create_case, get_case, list_cases, update_case, add_activity, split_entities_string
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["Investigation"])
 
 
-# ─── Schemas ──────────────────────────────────────────────────────────────────
+# ── Schemas ───────────────────────────────────────────────────────────────────
 class CreateCaseRequest(BaseModel):
     name: str
     description: Optional[str] = ""
@@ -36,7 +37,7 @@ class EntityExtractionRequest(BaseModel):
     text: str
 
 
-# ─── Routes ───────────────────────────────────────────────────────────────────
+# ── Routes ────────────────────────────────────────────────────────────────────
 @router.post("/api/investigation/create")
 async def create_investigation(request: CreateCaseRequest):
     """Create a new investigation case and execute initial AI investigation analysis."""
@@ -69,9 +70,7 @@ async def create_investigation(request: CreateCaseRequest):
     # Parse and classify user-provided entities with accurate types
     existing_vals = {e["value"].strip().lower() for e in entities_list if "value" in e}
     if raw_entities:
-        import re as _re
-        for item in _re.split(r"[\n,;]+", raw_entities):
-            item = item.strip()
+        for item in split_entities_string(raw_entities):
             if item and item.lower() not in existing_vals and len(item) > 1:
                 classified = classify_user_entity(item)
                 entities_list.append(classified)
@@ -118,7 +117,7 @@ async def create_investigation(request: CreateCaseRequest):
         }
 
         updated_case = update_case(case["id"], updates)
-        add_activity(case["id"], "AI Analysis Complete", f"Risk level: {updates['risk_level']} · {len(connections)} connections mapped")
+        add_activity(case["id"], "AI Analysis Complete", f"Risk level: {updates['risk_level']} • {len(connections)} connections mapped")
         return {"success": True, "case": updated_case or case}
 
     except Exception as e:
@@ -168,7 +167,7 @@ async def analyze_case(request: AnalyzeCaseRequest):
         }
 
         updated_case = update_case(request.case_id, updates)
-        add_activity(request.case_id, "AI Analysis Complete", f"Risk level: {updates['risk_level']} · {len(connections)} connections mapped")
+        add_activity(request.case_id, "AI Analysis Complete", f"Risk level: {updates['risk_level']} • {len(connections)} connections mapped")
 
         return {"success": True, "case_id": request.case_id, "analysis": analysis, "case": updated_case}
 

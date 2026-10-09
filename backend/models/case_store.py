@@ -1,15 +1,31 @@
-"""
+﻿"""
 TraceShield – In-Memory Case Store
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Lightweight in-memory persistence for cases during a session.
 For production, replace with PostgreSQL / MongoDB.
 """
 
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
 _cases: dict[str, dict] = {}
+
+
+def split_entities_string(raw: str) -> list[str]:
+    """Parse comma/newline separated entities preserving numbers with commas (e.g. Rs 2,50,000)."""
+    if not raw or not raw.strip():
+        return []
+    # Protect currency and formatted numbers before comma splitting
+    protected = re.sub(r'(\d+),(\d+)', r'\1__COMMA__\2', raw.strip())
+    items = []
+    for line in re.split(r'[\n;]+', protected):
+        for piece in line.split(','):
+            piece = piece.replace('__COMMA__', ',').strip()
+            if piece:
+                items.append(piece)
+    return items
 
 
 def create_case(data: dict) -> dict:
@@ -20,7 +36,8 @@ def create_case(data: dict) -> dict:
     # Ensure entities is always a list
     entities = raw_data.get("entities")
     if isinstance(entities, str):
-        entities = [{"type": "Entity", "value": item.strip(), "context": "initial"} for item in entities.split(",") if item.strip()]
+        parsed_items = split_entities_string(entities)
+        entities = [{"type": "Entity", "value": item, "context": "initial"} for item in parsed_items]
     elif not isinstance(entities, list):
         entities = []
 

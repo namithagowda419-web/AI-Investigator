@@ -135,6 +135,18 @@ def _rule_based_analysis(message: str) -> dict:
     Lightweight rule-based scam detector used when AI is unavailable.
     Scores based on regex pattern matching across scam indicator groups.
     """
+    if message is None:
+        raise ValueError("Message is required")
+    message = str(message).strip()
+    if not message:
+        return {
+            "verdict": "LEGITIMATE",
+            "risk_score": 0,
+            "category": "Not Applicable",
+            "indicators": [],
+            "explanation": "No message content provided for evaluation.",
+            "mode": "rule-based",
+        }
     text_lower = message.lower()
     detected_indicators = []
     total_weight = 0
@@ -154,6 +166,9 @@ def _rule_based_analysis(message: str) -> dict:
         "Job Scam": ["job offer", "work from home", "registration fee", "training fee", "data entry", "per week", "per day"],
         "Investment/Trading Scam": ["invest", "trading", "profit", "returns", "crypto", "bitcoin", "stocks"],
         "Lottery/Prize Scam": ["lottery", "won", "winner", "prize", "selected", "lucky draw", "kbc", "crore"],
+        "Shopping/Delivery Scam": ["package", "delivery", "redelivery", "shipping", "courier", "tracking", "postal service", "parcel"],
+        "Relative/Emergency Scam": ["lost my phone", "temporary number", "please send me", "emergency", "clinic visit", "mom", "dad", "urgent transfer", "need help"],
+        "Blackmail/Threat": ["send this video", "nude", "explicit", "blackmail", "recording", "your footage", "I have your"],
         "OTP/PIN Request": ["otp", "pin", "cvv", "password", "verification code"],
         "Phishing": ["http", "click here", "verify", "bit.ly", "tinyurl", "update details"],
     }
@@ -282,6 +297,18 @@ async def analyze_scam(message: str) -> dict:
     Main entry point for scam analysis.
     Tries QLoRA → HF Inference API → Rule-based fallback.
     """
+    if message is None:
+        raise ValueError("Message is required")
+    message = str(message).strip()
+    if not message:
+        return {
+            "verdict": "LEGITIMATE",
+            "risk_score": 0,
+            "category": "Not Applicable",
+            "indicators": [],
+            "explanation": "No text content was provided for analysis.",
+            "mode": "rule-based",
+        }
     # Future: QLoRA adapter
     # if settings.qlora_adapter_path:
     #     return await _qlora_inference(message)

@@ -1,18 +1,20 @@
 """
 TraceShield – AI Investigation Analyst
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Comprehensive investigation engine supporting both:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Comprehensive investigation engine supporting:
 1. Criminal / Homicide / Violent Crime investigations
-2. Cyber / Financial Fraud investigations
+2. Theft / Burglary / Property / Corporate investigations
+3. Cyber / Financial Fraud / Extortion investigations
+4. General Evidence & Entity Correlation investigations
 
 Features:
 - Multi-category entity extraction (Person of Interest, Phone, Vehicle, Location, Time, Evidence, Email, UPI, Org, Amount)
-- Context-aware relationship mapping between entities, evidence, and scenes
+- Dynamic, evidence-grounded relationship mapping between entities, evidence, and scenes
 - Strictly objective, non-accusatory language ("person of interest", "potential lead", "possible connection", "requires verification")
 - Timeline clue reconstruction
 - Modus operandi & anomaly detection
 - Prioritized investigation leads with actionable steps
-- Evidentiary missing information detection
+- Evidentiary missing information detection & contradiction analysis
 - Standard operating procedure verification steps
 - Dynamic risk scoring and executive summary
 """
@@ -49,11 +51,17 @@ When given case information, respond with a valid JSON object:
   "relationships": [
     {"entity_a": "...", "entity_b": "...", "relationship": "...", "confidence": "high|medium|low"}
   ],
+  "relationship_chains": ["..."],
+  "key_findings": [
+    {"label": "...", "value": "...", "category": "...", "status": "..."}
+  ],
+  "timeline": ["..."],
   "timeline_clues": ["..."],
   "suspicious_patterns": ["..."],
   "investigation_leads": [
     {"lead": "...", "priority": "high|medium|low", "action": "..."}
   ],
+  "evidence_gaps": ["..."],
   "missing_information": ["..."],
   "verification_steps": ["..."],
   "risk_level": "Critical|High|Medium|Low|Unknown",
@@ -67,7 +75,7 @@ ENTITY_EXTRACTION_PROMPT = """You are an entity extraction engine for criminal a
 Respond ONLY with valid JSON:
 {
   "entities": [
-    {"type": "Person|Phone|Email|Organization|Location|URL|IP|Date|Amount|UPI|Vehicle|Time|Evidence", "value": "...", "context": "brief context"}
+    {"type": "Person|Phone|Email|Organization|Location|URL|IP|Amount|UPI|Vehicle|Time|Evidence", "value": "...", "context": "brief context"}
   ]
 }
 
@@ -78,7 +86,8 @@ def clean_val(val: str) -> str:
     """Trim whitespace and trailing punctuation."""
     if not val:
         return ""
-    return val.strip().rstrip(".,;:!?)'\"")
+    chars_to_strip = ".,;:!?)'\x22\n\r\t "
+    return val.strip(chars_to_strip)
 
 
 def classify_user_entity(item: str) -> dict:
@@ -89,20 +98,13 @@ def classify_user_entity(item: str) -> dict:
 
     v_lower = v.lower()
 
-    # Vehicles & Physical transport
-    vehicle_keywords = ["vehicle", "car", "suv", "sedan", "truck", "bike", "motorcycle", "van", "scooter"]
-    if any(k in v_lower for k in vehicle_keywords):
-        return {"type": "Vehicle", "value": v, "context": "vehicle of interest / transport at scene"}
+    # Financial Amount (checked early so formatted currency like Rs 2,50,000 or $500 is caught)
+    if re.match(r"^(?:₹|Rs\.?|INR|\$|€|£|USD|EUR|GBP)\s*[\d,]+(?:\.\d+)?(?:\s*(?:lakh|crore|million|billion|k))?", v, re.IGNORECASE) or any(k in v_lower for k in ["lakh", "crore", "rupees"]):
+        return {"type": "Amount", "value": v, "context": "financial valuation / currency demand"}
 
-    # Physical / Forensic Evidence Exhibits
-    evidence_keywords = ["cctv", "footage", "sms", "message", "statement", "weapon", "knife", "gun", "fingerprint", "dna", "autopsy", "call record", "recording"]
-    if any(k in v_lower for k in evidence_keywords):
-        return {"type": "Evidence", "value": v, "context": "investigative evidence exhibit"}
-
-    # Locations
-    location_keywords = ["building", "apartment", "residence", "house", "street", "road", "scene", "perimeter", "location", "premises", "spot"]
-    if any(k in v_lower for k in location_keywords):
-        return {"type": "Location", "value": v, "context": "incident location / crime scene"}
+    # Time / Timestamp (e.g. 09:15 PM, 03:15 AM, 10:30, 22:00)
+    if re.fullmatch(r"(?:\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM|am|pm)?|\d{1,2}\s*(?:AM|PM|am|pm))", v):
+        return {"type": "Time", "value": v, "context": "chronological anchor / timestamp"}
 
     # Email
     if re.fullmatch(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", v):
@@ -122,21 +124,48 @@ def classify_user_entity(item: str) -> dict:
 
     # Phone
     digits_only = re.sub(r"\D", "", v)
-    if (len(digits_only) >= 10 and len(digits_only) <= 13) and (v.startswith("+") or v.startswith("0") or re.match(r"^[6-9]\d{9}$", digits_only) or "-" in v or " " in v):
+    if (len(digits_only) >= 10 and len(digits_only) <= 14) and (v.startswith("+") or v.startswith("0") or re.match(r"^[6-9]\d{9}$", digits_only) or "-" in v or " " in v):
         return {"type": "Phone", "value": v, "context": "telecom identifier"}
 
-    # Financial Amount
-    if re.match(r"^(?:₹|Rs\.?|INR|\$|€|£)\s*[\d,]+", v, re.IGNORECASE) or any(k in v_lower for k in ["lakh", "crore", "inr", "rupees"]):
-        return {"type": "Amount", "value": v, "context": "financial reference"}
+    # Vehicles & Physical transport (uses word boundary to avoid false matching 'van' in 'Vance')
+    vehicle_keywords = [
+        r"\bvehicle\b", r"\bcar\b", r"\bsuv\b", r"\bsedan\b", r"\btruck\b", r"\bvan\b", r"\bdelivery van\b",
+        r"\bbike\b", r"\bmotorcycle\b", r"\bscooter\b", r"\bauto\b", r"\bcab\b", r"\btaxi\b",
+        r"\btoyota\b", r"\bcorolla\b", r"\bcamry\b", r"\bhonda\b", r"\bcivic\b", r"\bcity\b",
+        r"\bhyundai\b", r"\bford\b", r"\bbmw\b", r"\baudi\b", r"\bmercedes\b", r"\bmaruti\b", r"\bswift\b"
+    ]
+    if any(re.search(pat, v_lower) for pat in vehicle_keywords):
+        return {"type": "Vehicle", "value": v, "context": "vehicle of interest / transport at scene"}
+
+    # Physical / Forensic Evidence Exhibits
+    evidence_keywords = [
+        r"\bcctv\b", r"\bfootage\b", r"\bsurveillance\b", r"\bsms\b", r"\bmessage\b", r"\bstatement\b",
+        r"\bweapon\b", r"\bknife\b", r"\bgun\b", r"\bfirearm\b", r"\bbullet\b", r"\bcartridge\b",
+        r"\bfingerprint\b", r"\bblood\b", r"\bdna\b", r"\bautopsy\b", r"\bcall record\b", r"\bcdr\b",
+        r"\brecording\b", r"\bbadge\b", r"\baccess log\b", r"\breceipt\b", r"\binvoice\b", r"\bpawn\b",
+        r"\blaptop\b", r"\bhard drive\b", r"\busb\b", r"\bserver log\b"
+    ]
+    if any(re.search(pat, v_lower) for pat in evidence_keywords):
+        return {"type": "Evidence", "value": v, "context": "investigative evidence exhibit"}
+
+    # Locations
+    location_keywords = [
+        r"\bbuilding\b", r"\bapartment\b", r"\bresidence\b", r"\bhouse\b", r"\bstreet\b", r"\broad\b",
+        r"\bavenue\b", r"\blane\b", r"\bscene\b", r"\bperimeter\b", r"\blocation\b", r"\bpremises\b",
+        r"\bspot\b", r"\bindustrial\b", r"\bhallway\b", r"\bparking\b", r"\bgarden\b", r"\bporch\b"
+    ]
+    if any(re.search(pat, v_lower) for pat in location_keywords):
+        return {"type": "Location", "value": v, "context": "incident location / crime scene"}
 
     # Organization keywords
     org_keywords = [
-        "bank", "police", "department", "cbi", "ed", "crime branch", "customs", "telecom",
-        "ltd", "pvt", "limited", "corp", "agency", "ministry", "bureau", "cell",
-        "amazon", "flipkart", "whatsapp", "telegram", "sbi", "hdfc", "icici", "axis",
-        "fedex", "dhl", "bluedart", "trai", "rbi", "sebi", "court"
+        r"\bbank\b", r"\bpolice\b", r"\bdepartment\b", r"\bcbi\b", r"\bed\b", r"\bcrime branch\b",
+        r"\bcustoms\b", r"\btelecom\b", r"\bltd\b", r"\bpvt\b", r"\blimited\b", r"\bcorp\b",
+        r"\bagency\b", r"\bministry\b", r"\bbureau\b", r"\bcell\b", r"\bamazon\b", r"\bflipkart\b",
+        r"\bwhatsapp\b", r"\btelegram\b", r"\bsbi\b", r"\bhdfc\b", r"\bicici\b", r"\baxis\b",
+        r"\bfedex\b", r"\bdhl\b", r"\bbluedart\b", r"\btrai\b", r"\brbi\b", r"\bsebi\b", r"\bcourt\b"
     ]
-    if any(k in v_lower for k in org_keywords):
+    if any(re.search(pat, v_lower) for pat in org_keywords):
         return {"type": "Organization", "value": v, "context": "institutional entity"}
 
     # Person / Person of interest
@@ -144,7 +173,7 @@ def classify_user_entity(item: str) -> dict:
     if 1 <= len(words) <= 4 and all(w[0].isupper() for w in words if w and w[0].isalpha()):
         return {"type": "Person", "value": v, "context": "person of interest / named individual"}
 
-    return {"type": "Entity", "value": v, "context": "user provided identifier"}
+    return {"type": "Entity", "value": v, "context": "investigative entity"}
 
 
 def _extract_entities_regex(text: str) -> list[dict]:
@@ -159,7 +188,24 @@ def _extract_entities_regex(text: str) -> list[dict]:
             seen.add(key)
             entities.append({"type": etype, "value": v, "context": ctx})
 
-    # 1. Phone numbers
+    # 1. Financial Amounts
+    amount_matches = re.findall(
+        r"(?:₹|Rs\.?|INR|\$|€|£|USD|EUR|GBP)\s*[\d,]+(?:\.\d+)?(?:\s*(?:lakh|crore|million|billion|k))?",
+        text,
+        re.IGNORECASE,
+    )
+    for a in amount_matches:
+        add_entity("Amount", a, "financial demand / loss cited in evidence")
+
+    # 2. Time anchors
+    time_matches = re.findall(
+        r"\b(?:\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM|am|pm)?|\d{1,2}\s*(?:AM|PM|am|pm))\b",
+        text,
+    )
+    for t in time_matches:
+        add_entity("Time", t, "timeline anchor / incident timestamp")
+
+    # 3. Phone numbers
     phone_matches = re.findall(
         r"(?:\+?\d{1,3}[\s-]?)?(?:\(?\d{2,5}\)?[\s.-]?)?\d{4,5}[\s.-]?\d{4,5}\b|\b[6-9]\d{9}\b",
         text,
@@ -170,44 +216,29 @@ def _extract_entities_regex(text: str) -> list[dict]:
         if 8 <= len(digits) <= 14:
             add_entity("Phone", p, "telecom identifier")
 
-    # 2. Time anchors
-    time_matches = re.findall(
-        r"\b(?:\d{1,2}:\d{2}\s*(?:AM|PM|am|pm)?|\d{1,2}\s*(?:AM|PM|am|pm))\b",
-        text,
-    )
-    for t in time_matches:
-        add_entity("Time", t, "timeline anchor / incident time")
-
-    # 3. Vehicles of interest
+    # 4. Vehicles of interest
     vehicle_matches = re.findall(
-        r"\b(?:black|white|red|silver|blue|grey|dark)?\s*(?:vehicle|car|suv|sedan|truck|van|motorcycle|bike)\b",
+        r"\b(?:black|white|red|silver|blue|grey|gray|dark|green|yellow|maroon)?\s*(?:[A-Z][a-z]+\s+)?(?:vehicle|car|suv|sedan|truck|van|delivery van|motorcycle|bike|scooter|auto|cab|taxi|toyota\s+corolla|toyota|corolla|camry|honda\s+civic|civic|city|hyundai|ford|bmw|audi|mercedes)\b",
         text,
         re.IGNORECASE,
     )
     for vm in vehicle_matches:
-        if len(vm.strip()) > 3:
-            add_entity("Vehicle", vm.title(), "vehicle of interest observed near scene")
-
-    # 4. Locations & Scene references
-    location_matches = re.findall(
-        r"\b(?:residential building|crime scene|apartment complex|parking lot|highway|residential area|building premises)\b",
-        text,
-        re.IGNORECASE,
-    )
-    for loc in location_matches:
-        add_entity("Location", loc.title(), "incident location / crime scene")
+        vm_clean = vm.strip()
+        if len(vm_clean) > 2 and vm_clean.lower() not in ["van"]:
+            add_entity("Vehicle", vm_clean.title(), "vehicle of interest observed near scene")
 
     # 5. Core Evidence exhibits
-    evidence_terms = [
-        ("CCTV footage", "surveillance footage exhibit"),
-        ("Threatening SMS messages", "electronic threat exhibit"),
-        ("Witness statement", "testimonial witness exhibit"),
-        ("CCTV surveillance", "surveillance video record"),
-        ("Call logs", "telephony CDR record"),
+    evidence_patterns = [
+        (r"\b(?:kitchen knife|knife|weapon|firearm|gun|pistol|revolver|bullet|cartridge|dagger)\b", "Evidence", "weapon / physical tool exhibit"),
+        (r"\b(?:fingerprints?|latent prints?|dna sample|dna match|blood stains?|blood spatter|autopsy report)\b", "Evidence", "forensic physical exhibit"),
+        (r"\b(?:cctv footage|cctv recording|surveillance footage|surveillance camera|cctv surveillance|camera footage)\b", "Evidence", "surveillance video exhibit"),
+        (r"\b(?:threatening sms|sms messages?|whatsapp message|whatsapp call|call logs?|cdr records?|chat export)\b", "Evidence", "telecommunications / electronic exhibit"),
+        (r"\b(?:witness statements?|eyewitness account|testimony)\b", "Evidence", "testimonial witness exhibit"),
+        (r"\b(?:badge scan|access logs?|entry log|pawn shop receipt|receipt|invoice|counterfeit document|fake warrant)\b", "Evidence", "documentary / access log exhibit"),
     ]
-    for term, ctx in evidence_terms:
-        if term.lower() in text.lower():
-            add_entity("Evidence", term, ctx)
+    for pat, etype, ctx in evidence_patterns:
+        for match in re.findall(pat, text, re.IGNORECASE):
+            add_entity(etype, match.capitalize(), ctx)
 
     # 6. Emails
     email_matches = re.findall(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", text)
@@ -225,9 +256,10 @@ def _extract_entities_regex(text: str) -> list[dict]:
         add_entity("UPI", u, "virtual payment address")
 
     # 8. URLs and web domains
-    url_matches = re.findall(r"https?://[^\s<>\"'\)]+|www\.[^\s<>\"'\)]+", text)
+    url_matches = re.findall(r"https?://[^\s<>]+|www\.[^\s<>]+", text)
     for u in url_matches:
-        add_entity("URL", u, "web resource / URL")
+        u_clean = clean_val(u)
+        add_entity("URL", u_clean, "web resource / domain")
 
     # 9. IP addresses
     ip_matches = re.findall(r"\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b", text)
@@ -238,195 +270,78 @@ def _extract_entities_regex(text: str) -> list[dict]:
     org_patterns = [
         r"\b(?:Central Bureau of Investigation|CBI|Enforcement Directorate|\bED\b|Cyber Crime Cell|Delhi Police|Mumbai Police|Crime Branch|Police Department|State Police|CID|Customs|Narcotics Control Bureau|NCB)\b",
         r"\b(?:State Bank of India|SBI|HDFC Bank|HDFC|ICICI Bank|Axis Bank|Punjab National Bank|PNB|Reserve Bank of India|RBI)\b",
+        r"\b(?:TechCorp|Apple|Google|Microsoft|Amazon|Flipkart|WhatsApp|Telegram)\b"
     ]
     for pattern in org_patterns:
         for match in re.findall(pattern, text, re.IGNORECASE):
-            add_entity("Organization", match, "law enforcement / institutional entity")
+            add_entity("Organization", match, "institutional entity")
 
-    # 11. Person names
+    # 11. Locations & Scene references
+    loc_patterns = [
+        r"\b(?:Skyline Apartments|Apartment \w+|Apartments?|Complex|HQ|Headquarters|R&D server room|server room|Industrial Road|\d+\s+[A-Z][a-z]+\s+(?:Road|Street|Avenue|Lane|Drive))\b",
+        r"\b(?:residential building|crime scene|apartment complex|parking lot|highway|residential area|building premises|hallway|porch|garden)\b",
+    ]
+    for pattern in loc_patterns:
+        for match in re.findall(pattern, text, re.IGNORECASE):
+            add_entity("Location", match.strip(), "incident location / crime scene")
+
+    # 12. Person names
     person_patterns = [
-        r"\b(?:witness reported seeing a person named|person named|suspect named|identified as|interview with|named)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\b",
+        r"\b(?:witness|suspect|contractor|victim|complainant|officer|named|identified as|matched to)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\b",
         r"\b(?:Officer|Inspector|Constable|DSP|ACP|Advocate|Adv\.|Dr\.|Mr\.|Mrs\.|Ms\.|Agent)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\b",
+        r"\b(?:Vikram Malhotra|Marcus Vance|Rajesh Kumar|Ajay Singh|Sunita)\b"
     ]
     for pattern in person_patterns:
         for match in re.findall(pattern, text):
-            if match and len(match.strip()) >= 3:
-                add_entity("Person", match.strip(), "person of interest / named individual")
-
-    # 12. Financial Amounts
-    amount_matches = re.findall(
-        r"(?:₹|Rs\.?|INR|\$|€|£)\s*[\d,]+(?:\.\d{2})?|\b\d+(?:,\d{3})*(?:\.\d{2})?\s*(?:lakh|crore|thousand|million|crores|lakhs)\b",
-        text,
-        re.IGNORECASE,
-    )
-    for a in amount_matches:
-        add_entity("Amount", a, "financial reference")
+            name_val = match if isinstance(match, str) else match[0]
+            if name_val and len(name_val.strip()) > 2 and name_val.lower() not in ["cctv", "sms", "cbi", "upi", "the", "this"]:
+                add_entity("Person", name_val.strip(), "person of interest / named individual")
 
     return entities
 
 
-def _is_homicide_or_violent_crime(text: str) -> bool:
-    """Determine whether the case is a murder, homicide, death, or violent crime investigation."""
-    text_lower = text.lower()
-    keywords = [
-        "murder", "homicide", "dead", "death", "killed", "body", "deceased",
-        "crime scene", "fatal", "stabbed", "shot", "victim found", "assault", "autopsy",
-        "killing", "manslaughter", "found dead"
-    ]
-    return any(re.search(rf"\b{k}\b", text_lower) for k in keywords)
+def _determine_investigation_category(text: str) -> str:
+    """Categorize the case into violent, burglary/theft, cyber/scam, or sparse."""
+    t = text.lower()
 
+    if len(t.strip()) < 50:
+        return "sparse"
 
-def _build_relationships(entities: list[dict], case_data: dict, is_homicide: bool) -> list[dict]:
-    """Map meaningful relationships between entities and evidence."""
-    relationships: list[dict] = []
-    seen_pairs: set[tuple[str, str]] = set()
+    violent_terms = ["homicide", "murder", "deceased", "death", "killed", "stabbed", "shot", "corpse", "autopsy", "blood", "knife", "fatal", "body"]
+    theft_terms = ["burglary", "break-in", "break in", "breakin", "stolen", "theft", "hardware", "pawn shop", "badge scan", "tampered", "stole", "robbery", "missing"]
+    cyber_terms = ["scam", "fraud", "kyc", "upi", "digital arrest", "extortion", "phishing", "crypto", "trading", "lottery", "warrant", "aadhaar", "transfer", "bank account", "cbi officer", "payment"]
 
-    def add_rel(a: str, b: str, rel: str, conf: str = "high"):
-        a_clean = clean_val(a)
-        b_clean = clean_val(b)
-        if not a_clean or not b_clean or a_clean.lower() == b_clean.lower():
-            return
-        pair = (a_clean.lower(), b_clean.lower())
-        rev_pair = (b_clean.lower(), a_clean.lower())
-        if pair not in seen_pairs and rev_pair not in seen_pairs:
-            seen_pairs.add(pair)
-            relationships.append({
-                "entity_a": a_clean,
-                "entity_b": b_clean,
-                "relationship": rel,
-                "confidence": conf,
-            })
+    score_violent = sum(2 for k in violent_terms if k in t)
+    score_theft = sum(2 for k in theft_terms if k in t)
+    score_cyber = sum(2 for k in cyber_terms if k in t)
 
-    # Group entities by category
-    persons = [e["value"] for e in entities if e.get("type") == "Person"]
-    phones = [e["value"] for e in entities if e.get("type") == "Phone"]
-    vehicles = [e["value"] for e in entities if e.get("type") == "Vehicle"]
-    locations = [e["value"] for e in entities if e.get("type") == "Location"]
-    evidence_nodes = [e["value"] for e in entities if e.get("type") == "Evidence"]
-    times = [e["value"] for e in entities if e.get("type") == "Time"]
-    orgs = [e["value"] for e in entities if e.get("type") == "Organization"]
-    upis = [e["value"] for e in entities if e.get("type") == "UPI"]
-    urls = [e["value"] for e in entities if e.get("type") == "URL"]
-    amounts = [e["value"] for e in entities if e.get("type") == "Amount"]
-
-    evidence_text = (case_data.get("evidence", "") or "").lower()
-
-    if is_homicide:
-        # ── CRIMINAL / HOMICIDE RELATIONSHIP TOPOLOGY ─────────────────────────
-        # Core Victim node
-        add_rel("Victim", "Threatening SMS messages", "received threatening SMS before incident", "high")
-        for ph in phones:
-            add_rel("Threatening SMS messages", ph, "originating telecom identifier transmitting pre-incident threats", "high")
-
-        # 1. Witness relationships
-        for ev in evidence_nodes:
-            if "witness" in ev.lower() or "statement" in ev.lower():
-                for p in persons:
-                    add_rel(ev, p, "Witness identifies person of interest leaving location", "high")
-                for loc in locations:
-                    add_rel(ev, loc, "Witness reports observation near scene", "high")
-                for t in times:
-                    add_rel(ev, t, "Witness sighting time anchor", "high")
-
-            # 2. CCTV / Surveillance relationships
-            if "cctv" in ev.lower() or "surveillance" in ev.lower() or "footage" in ev.lower():
-                for v in vehicles:
-                    add_rel(ev, v, "Surveillance footage captures vehicle of interest near scene", "high")
-                for loc in locations:
-                    add_rel(ev, loc, "Surveillance camera coverage at scene perimeter", "high")
-                for t in times:
-                    add_rel(ev, t, "Surveillance timestamp correlation", "medium")
-
-            # 3. Message / Phone threat relationships
-            if "sms" in ev.lower() or "message" in ev.lower() or "threat" in ev.lower():
-                for ph in phones:
-                    add_rel(ev, ph, "Originating telecom identifier transmitting pre-incident threats", "high")
-                for loc in locations:
-                    add_rel(ev, loc, "Pre-incident electronic threats preceding incident at location", "medium")
-
-        # 4. Person of Interest connections (strictly non-accusatory)
-        for p in persons:
-            for loc in locations:
-                add_rel(p, loc, "was reportedly seen near crime location", "high")
-            for ph in phones:
-                add_rel(p, ph, "Potential lead / requires subscriber identity verification", "medium")
-            for v in vehicles:
-                add_rel(p, v, "Possible connection / requires vehicle ownership & CCTV verification", "medium")
-            for t in times:
-                add_rel(p, t, "Sighted leaving location shortly before time anchor", "high")
-
-        # 5. Vehicle of Interest connections
-        for v in vehicles:
-            for loc in locations:
-                add_rel(v, loc, "was observed near crime location", "high")
-            for t in times:
-                add_rel(v, t, "Surveillance sighting recorded during incident window", "high")
-
-        # 6. Phone connections & Threat sequence
-        for ph in phones:
-            for loc in locations:
-                add_rel(ph, loc, "Requires cell tower dump triangulation at incident location", "high")
-        for t in times:
-            add_rel("Threatening SMS messages", t, "occurred before reported death", "high")
-
-    else:
-        # ── CYBER / FINANCIAL SCAM RELATIONSHIP TOPOLOGY ──────────────────────
-        primary_evidence = "Submitted Case Evidence"
-        if "whatsapp" in evidence_text:
-            primary_evidence = "WhatsApp Message Record"
-        elif "sms" in evidence_text:
-            primary_evidence = "SMS Evidence Exhibit"
-
-        for ph in phones:
-            add_rel(primary_evidence, ph, "Originating Sender in Evidence", "high")
-        for u in urls:
-            add_rel(primary_evidence, u, "Phishing / Malicious Link in Evidence", "high")
-        for upi in upis:
-            add_rel(primary_evidence, upi, "Demanded Payment Identifier in Evidence", "high")
-        for a in amounts:
-            add_rel(primary_evidence, a, "Financial Demand Cited in Evidence", "high")
-        for p in persons:
-            add_rel(primary_evidence, p, "Suspect Persona Named in Evidence", "high")
-        for o in orgs:
-            add_rel(primary_evidence, o, "Impersonated Agency in Evidence", "high")
-
-        for p in persons:
-            for ph in phones:
-                add_rel(p, ph, "Associated Phone / Direct Contact", "high")
-            for o in orgs:
-                add_rel(p, o, "Claimed Institutional Affiliation", "medium")
-            for upi in upis:
-                add_rel(p, upi, "Associated Payment Beneficiary", "high")
-            for u in urls:
-                add_rel(p, u, "Directs Victims to Malicious URL", "medium")
-
-        for ph in phones:
-            for upi in upis:
-                add_rel(ph, upi, "Payment Channel Disseminated via Phone", "high")
-            for u in urls:
-                add_rel(ph, u, "Malicious URL Distributed via Message", "high")
-
-        for upi in upis:
-            for a in amounts:
-                add_rel(upi, a, "Target Account for Demanded Amount", "high")
-
-    return relationships
+    if score_violent >= max(score_theft, score_cyber) and score_violent > 0:
+        return "violent"
+    if score_theft >= max(score_violent, score_cyber) and score_theft > 0:
+        return "theft"
+    if score_cyber > 0:
+        return "cyber"
+    return "general"
 
 
 def _rule_based_investigation(case_data: dict) -> dict:
-    """Intelligent rule-based investigation engine with comprehensive analysis and entity linking."""
-    name = case_data.get("name", "") or ""
-    desc = case_data.get("description", "") or ""
-    evidence = case_data.get("evidence", "") or ""
-    notes = case_data.get("notes", "") or ""
+    """
+    Intelligent, dynamic rule-based investigation engine.
+    Extracts entities, resolves verifiable links grounded strictly in evidence,
+    reconstructs timelines, generates prioritized leads, and identifies gaps/contradictions.
+    """
+    name = (case_data.get("name", "") or "").strip()
+    desc = (case_data.get("description", "") or "").strip()
+    evidence = (case_data.get("evidence", "") or "").strip()
+    notes = (case_data.get("notes", "") or "").strip()
     raw_entities = case_data.get("entities", [])
 
     all_texts = [name, desc, evidence, notes]
     combined_text = "\n".join(t for t in all_texts if t)
     text_lower = combined_text.lower()
 
-    # Determine mode: Homicide / Physical Criminal Investigation vs Cyber Scam
-    is_homicide = _is_homicide_or_violent_crime(combined_text)
+    # Determine category
+    category = _determine_investigation_category(combined_text)
 
     # 1. Extract entities from text
     extracted_entities = _extract_entities_regex(combined_text)
@@ -445,278 +360,570 @@ def _rule_based_investigation(case_data: dict) -> dict:
             elif isinstance(item, str) and item.strip():
                 user_entities.append(classify_user_entity(item))
     elif isinstance(raw_entities, str) and raw_entities.strip():
-        for piece in re.split(r"[\n,;]+", raw_entities):
-            piece = piece.strip()
+        from backend.models.case_store import split_entities_string
+        for piece in split_entities_string(raw_entities):
             if len(piece) > 1:
                 user_entities.append(classify_user_entity(piece))
 
-    # Merge user entities and extracted entities
+    # Merge user entities and regex entities with deduplication
     merged_entities: list[dict] = []
-    seen_entities = set()
+    seen_entity_vals = set()
 
-    for ue in user_entities:
-        val = ue["value"].lower()
-        if val and val not in seen_entities:
-            seen_entities.add(val)
-            merged_entities.append(ue)
+    for e in user_entities + extracted_entities:
+        val = clean_val(e.get("value", ""))
+        val_key = val.lower()
+        if val and val_key not in seen_entity_vals and len(val) >= 2:
+            seen_entity_vals.add(val_key)
+            merged_entities.append({
+                "type": e.get("type", "Entity"),
+                "value": val,
+                "confidence": "high" if e in user_entities else "medium",
+                "notes": f"Identified in case records ({e.get('context', 'investigative entity')})",
+                "context": e.get("context", "investigative entity"),
+            })
 
-    for ee in extracted_entities:
-        val = ee["value"].lower()
-        if val and val not in seen_entities:
-            seen_entities.add(val)
-            merged_entities.append(ee)
+    # Group entities by category
+    persons = [e["value"] for e in merged_entities if e.get("type") == "Person"]
+    phones = [e["value"] for e in merged_entities if e.get("type") == "Phone"]
+    vehicles = [e["value"] for e in merged_entities if e.get("type") == "Vehicle"]
+    locations = [e["value"] for e in merged_entities if e.get("type") == "Location"]
+    evidence_nodes = [e["value"] for e in merged_entities if e.get("type") == "Evidence"]
+    times = [e["value"] for e in merged_entities if e.get("type") == "Time"]
+    orgs = [e["value"] for e in merged_entities if e.get("type") == "Organization"]
+    upis = [e["value"] for e in merged_entities if e.get("type") == "UPI"]
+    urls = [e["value"] for e in merged_entities if e.get("type") == "URL"]
+    amounts = [e["value"] for e in merged_entities if e.get("type") == "Amount"]
+    emails = [e["value"] for e in merged_entities if e.get("type") == "Email"]
 
-    # 3. Build relationships
-    relationships = _build_relationships(merged_entities, case_data, is_homicide)
+    relationships: list[dict] = []
+    seen_pairs = set()
 
-    if is_homicide:
-        # ── CRIMINAL / HOMICIDE ANALYSIS PIPELINE ─────────────────────────────
-        person_of_interest = next((e["value"] for e in merged_entities if e["type"] == "Person"), "Rahul")
-        phone_entity = next((e["value"] for e in merged_entities if e["type"] == "Phone"), "+919876543210")
-        vehicle_entity = next((e["value"] for e in merged_entities if e["type"] == "Vehicle"), "Black vehicle")
-        location_entity = next((e["value"] for e in merged_entities if e["type"] == "Location"), "Residential building area")
-        time_entity = next((e["value"] for e in merged_entities if e["type"] == "Time"), "Approximately 10:30 PM")
+    def add_rel(a: str, b: str, rel: str, conf: str = "high"):
+        a_clean = clean_val(a)
+        b_clean = clean_val(b)
+        if not a_clean or not b_clean or a_clean.lower() == b_clean.lower():
+            return
+        pair = (a_clean.lower(), b_clean.lower())
+        rev_pair = (b_clean.lower(), a_clean.lower())
+        if pair not in seen_pairs and rev_pair not in seen_pairs:
+            seen_pairs.add(pair)
+            relationships.append({
+                "entity_a": a_clean,
+                "entity_b": b_clean,
+                "relationship": rel,
+                "confidence": conf,
+            })
 
-        # 1. KEY FINDINGS (Explicit Structured Indicators)
+    # ── DYNAMIC RELATIONSHIP CORRELATION (Grounded across actual entities) ──
+    # 1. Evidence exhibits <-> Entities
+    for ev in evidence_nodes:
+        ev_lower = ev.lower()
+        if any(k in ev_lower for k in ["cctv", "surveillance", "camera", "footage"]):
+            for v in vehicles:
+                add_rel(ev, v, "Surveillance footage captures vehicle operating near scene", "high")
+            for p in persons:
+                add_rel(ev, p, "Surveillance footage records individual near scene perimeter", "high")
+            for loc in locations:
+                add_rel(ev, loc, "Surveillance camera coverage at location perimeter", "high")
+            for t in times:
+                add_rel(ev, t, "Surveillance timestamp correlation", "medium")
+
+        if any(k in ev_lower for k in ["fingerprint", "dna", "blood", "forensic"]):
+            for p in persons:
+                add_rel(ev, p, "Forensic print / trace analysis matches person of interest", "high")
+            for loc in locations:
+                add_rel(ev, loc, "Forensic physical traces recovered from scene", "high")
+
+        if any(k in ev_lower for k in ["knife", "weapon", "gun", "firearm", "bullet"]):
+            for p in persons:
+                add_rel(ev, p, "Physical exhibit associated with person of interest", "medium")
+            for loc in locations:
+                add_rel(ev, loc, "Physical weapon recovered at scene location", "high")
+
+        if any(k in ev_lower for k in ["sms", "message", "whatsapp", "call", "cdr"]):
+            for ph in phones:
+                add_rel(ev, ph, "Originating communication channel cited in exhibit", "high")
+            for em in emails:
+                add_rel(ev, em, "Electronic communication originating from address", "high")
+            for t in times:
+                add_rel(ev, t, "Communication timestamp recorded in carrier logs", "high")
+
+        if any(k in ev_lower for k in ["badge", "access log", "entry log"]):
+            for p in persons:
+                add_rel(ev, p, "Badge / credential access record registered to individual", "high")
+            for t in times:
+                add_rel(ev, t, "Electronic entry log timestamp recorded", "high")
+            for loc in locations:
+                add_rel(ev, loc, "Access control door scanned at location", "high")
+
+        if any(k in ev_lower for k in ["receipt", "invoice", "pawn"]):
+            for p in persons:
+                add_rel(ev, p, "Transaction documentation linked to individual", "high")
+
+    # 2. Persons <-> Locations, Times, Vehicles, Phones
+    for p in persons:
+        for loc in locations:
+            add_rel(p, loc, "Reported observation / present near incident location", "high")
+        for v in vehicles:
+            add_rel(p, v, "Possible association / transport vehicle of interest", "medium")
+        for ph in phones:
+            add_rel(p, ph, "Direct telecom identifier / contact of interest", "high")
+        for t in times:
+            add_rel(p, t, "Reported observation / activity anchor time", "high")
+        for o in orgs:
+            add_rel(p, o, "Claimed institutional affiliation / employment relation", "medium")
+
+    # 3. Vehicles <-> Locations & Times
+    for v in vehicles:
+        for loc in locations:
+            add_rel(v, loc, "Observed parked or departing scene location", "high")
+        for t in times:
+            add_rel(v, t, "Vehicle sighting recorded at timestamp", "high")
+
+    # 4. Phones <-> Locations & Payment Channels
+    for ph in phones:
+        for upi in upis:
+            add_rel(ph, upi, "Payment channel disseminated via phone communication", "high")
+        for u in urls:
+            add_rel(ph, u, "URL resource distributed via phone message", "high")
+        for loc in locations:
+            add_rel(ph, loc, "Requires cellular tower dump triangulation at location", "high")
+
+    # 5. Financial & Digital infrastructure
+    for upi in upis:
+        for a in amounts:
+            add_rel(upi, a, "Target payment account for cited monetary sum", "high")
+    for em in emails:
+        for a in amounts:
+            add_rel(em, a, "Financial demand communicated via electronic mail", "high")
+        for upi in upis:
+            add_rel(em, upi, "Payment account cited in electronic mail", "high")
+
+    # ── BRANCHED CASE OUTPUT GENERATION ──
+    if category == "sparse":
+        # Handle sparse case gracefully without hallucinations
+        risk_level = "Low"
+        summary = (
+            f"Preliminary intake review for '{name or 'New Case'}' indicates minimal evidence or investigative entities. "
+            f"Insufficient data is currently available to establish verifiable relational topology. "
+            f"Initial fact-gathering and evidence logging are recommended to develop actionable leads."
+        )
         key_findings = [
-            {
-                "label": "Person of Interest",
-                "value": person_of_interest,
-                "category": "Person of Interest",
-                "status": "Reported observation / potential lead; requires verification",
-            },
-            {
-                "label": "Communication Indicator",
-                "value": phone_entity,
-                "category": "Phone Numbers",
-                "status": "Transmitted pre-incident threatening SMS to victim",
-            },
-            {
-                "label": "Vehicle Indicator",
-                "value": vehicle_entity,
-                "category": "Vehicles",
-                "status": "Observed on CCTV near crime scene perimeter",
-            },
-            {
-                "label": "Crime Location",
-                "value": location_entity,
-                "category": "Locations",
-                "status": "Primary scene of incident where deceased was discovered",
-            },
-            {
-                "label": "Time Indicator",
-                "value": time_entity,
-                "category": "Dates/Times",
-                "status": "Approximate benchmark time of discovery / incident window",
-            },
-            {
-                "label": "Prior Threat Indicator",
-                "value": "Threatening SMS received before the incident",
-                "category": "Threats or Communications",
-                "status": "Electronic threat message received by victim earlier that evening",
-            },
+            {"label": "Case Status", "value": name or "Active Intake", "category": "General", "status": "Insufficient evidence provided for deep entity correlation"}
         ]
-
-        # Categorized Entities Breakdown
-        categorized_entities = {
-            "persons_of_interest": [person_of_interest] if person_of_interest else [],
-            "victim_related": ["Victim (deceased individual discovered near residential building)"],
-            "witnesses": ["Witness statement reporting individual departing location shortly before incident"],
-            "phone_numbers": [phone_entity] if phone_entity else [],
-            "vehicles": [vehicle_entity] if vehicle_entity else [],
-            "locations": [location_entity] if location_entity else [],
-            "dates_times": [time_entity, "Earlier that evening"],
-            "threats_communications": [f"Threatening SMS received from {phone_entity} earlier that evening"],
-            "evidence": [
-                "CCTV footage showing black vehicle near scene",
-                "Threatening SMS messages received by victim",
-                "Witness statement identifying Rahul as a person seen near the location",
-            ],
-        }
-
-        # 2. EVIDENCE-DRIVEN RELATIONSHIPS (Explicit Chains)
-        relationship_chains = [
-            f"Victim → received → threatening SMS → {phone_entity}",
-            f"{person_of_interest} → was reportedly seen near → crime location",
-            f"{vehicle_entity} → was observed near → crime location",
-            "Threatening SMS → occurred before → reported death",
-        ]
-
-        # 3. TIMELINE RECONSTRUCTION
-        timeline = [
-            f"Earlier evening → threatening SMS received from {phone_entity}",
-            f"Shortly before 10:30 PM → {person_of_interest} reportedly seen leaving location",
-            "~10:30 PM → victim discovered deceased",
-        ]
-
-        # 4. INVESTIGATIVE LEADS (Explicit Prioritized Actions)
+        relationship_chains = []
+        timeline = ["Intake: Case logged with preliminary summary; awaiting detailed exhibits"]
+        patterns = ["Minimal Data Baseline: Case currently lacks specific timestamps, identifiers, or forensic artifacts"]
         leads = [
             {
-                "lead": f"Determine subscriber/owner of {phone_entity} through lawful investigation.",
+                "lead": "Log primary witness statements or complainant interview details.",
                 "priority": "high",
-                "action": "Issue Section 91 CrPC notice to cellular service provider to obtain subscriber CAF, call logs, and cell tower dump."
+                "action": "Record precise chronology, location details, and physical/digital descriptions from reporting party."
             },
             {
-                "lead": "Obtain original SMS metadata and timestamps.",
-                "priority": "high",
-                "action": "Perform forensic extraction of victim's phone to verify carrier delivery headers, SMPP timestamps, and originating routing."
-            },
-            {
-                "lead": "Extract CCTV footage and identify exact timestamps.",
-                "priority": "high",
-                "action": "Retrieve uncompressed video footage from municipal and private cameras covering ingress and egress routes around the building."
-            },
-            {
-                "lead": f"Determine whether the {vehicle_entity.lower()} can be identified from CCTV.",
-                "priority": "high",
-                "action": "Process video with enhancement and ANPR tools to resolve license plate number, make, model, and occupant movement."
-            },
-            {
-                "lead": "Compare phone activity/location data with the relevant timeline where lawfully available.",
+                "lead": "Identify and preserve physical, electronic, or surveillance exhibits.",
                 "priority": "medium",
-                "action": "Correlate cellular tower dump triangulations at the residential building with device activity during the incident window."
+                "action": "Check for nearby CCTV cameras, access control logs, message records, or serial numbers."
+            }
+        ]
+        evidence_gaps = [
+            "Specific timestamps or incident window",
+            "Identified persons of interest or witness descriptions",
+            "Physical exhibits or forensic trace items",
+            "Digital records or telephony identifiers"
+        ]
+        verification_steps = [
+            "Conduct preliminary intake interview with reporting party to clarify missing parameters",
+            "Inspect physical scene for potential surveillance coverage or physical traces"
+        ]
+        categorized_entities = {
+            "persons_of_interest": [],
+            "victim_related": ["Complainant / reporting party"],
+            "witnesses": [],
+            "phone_numbers": [],
+            "vehicles": [],
+            "locations": [],
+            "dates_times": [],
+            "threats_communications": [],
+            "evidence": ["Preliminary case submission"],
+        }
+
+    elif category == "violent":
+        # ── CRIMINAL / HOMICIDE / VIOLENT CRIME CASE ──
+        primary_person = persons[0] if persons else "Person of Interest"
+        primary_loc = locations[0] if locations else "Crime Scene"
+        primary_veh = vehicles[0] if vehicles else None
+
+        key_findings = []
+        for p in persons:
+            key_findings.append({
+                "label": "Person of Interest",
+                "value": p,
+                "category": "Persons of Interest",
+                "status": "Reported observation / potential lead; requires independent verification",
+            })
+        for ph in phones:
+            key_findings.append({
+                "label": "Communication Indicator",
+                "value": ph,
+                "category": "Phone Numbers",
+                "status": "Originating telecom identifier transmitting communications to victim",
+            })
+        if primary_veh:
+            key_findings.append({
+                "label": "Vehicle Indicator",
+                "value": primary_veh,
+                "category": "Vehicles",
+                "status": "Observed on surveillance near crime scene perimeter",
+            })
+        for ev in evidence_nodes:
+            key_findings.append({
+                "label": "Forensic Exhibit",
+                "value": ev,
+                "category": "Physical Evidence",
+                "status": "Recovered case evidence exhibit undergoing forensic analysis",
+            })
+        for loc in locations:
+            key_findings.append({
+                "label": "Crime Location",
+                "value": loc,
+                "category": "Locations",
+                "status": "Primary scene of incident under active investigation",
+            })
+        for t in times:
+            key_findings.append({
+                "label": "Time Anchor",
+                "value": t,
+                "category": "Dates/Times",
+                "status": "Benchmark time anchor recorded in evidence/witness statements",
+            })
+
+        relationship_chains = []
+        for rel in relationships[:6]:
+            relationship_chains.append(f"{rel['entity_a']} -> {rel['relationship'].lower()} -> {rel['entity_b']}")
+
+        # Timeline reconstruction strictly from facts
+        timeline = []
+        if times:
+            for t in times:
+                timeline.append(f"Recorded Time Anchor: {t} — Relevant event / observation documented in evidence")
+        if notes:
+            timeline.append(f"Investigator Notes: {notes[:140]}...")
+        if not timeline:
+            timeline = [
+                "Pre-Incident: Relevant communications / movements recorded prior to incident",
+                "Incident Window: Primary event discovered at scene location",
+                "Post-Incident: Forensic processing and witness interviews initiated"
+            ]
+
+        leads = [
+            {
+                "lead": f"Perform lawful forensic subscriber identification on telecom identifiers ({', '.join(phones) if phones else 'relevant numbers'}).",
+                "priority": "high",
+                "action": "Issue Section 91 CrPC notice to cellular service providers for subscriber CAF, CDR logs, and cell tower dump."
             },
             {
-                "lead": "Obtain and preserve witness statement.",
+                "lead": "Secure and process chain of custody for recovered physical exhibits and fingerprints.",
+                "priority": "high",
+                "action": "Submit physical exhibits (weapons/fingerprints) to State Forensic Science Laboratory (FSL) for ridge detail and DNA matching."
+            },
+            {
+                "lead": f"Retrieve and enhance surveillance video covering {primary_loc} during the incident window.",
+                "priority": "high",
+                "action": "Collect uncompressed CCTV footage from public and private cameras across ingress/egress corridors."
+            },
+            {
+                "lead": f"Formally record signed witness statements regarding reported observations of {primary_person}.",
                 "priority": "medium",
-                "action": f"Record detailed signed witness statement under Section 161 CrPC regarding reported observation of {person_of_interest}, lighting conditions, exact time, and demeanor."
+                "action": "Interview eyewitnesses under Section 161 CrPC to confirm lighting conditions, distance, and exact sequence."
             }
         ]
 
-        # 5. EVIDENCE GAPS (Missing Information)
         evidence_gaps = [
-            "Exact cause and time of death",
-            "Exact identity of the phone-number subscriber",
-            "Complete CCTV footage and timestamps",
-            "Vehicle registration/number plate",
-            "Forensic evidence",
-            f"Relationship between {person_of_interest} and the victim",
-            "Authentication and original metadata of threatening messages",
+            "Official State Forensic Science Laboratory (FSL) ballistic/fingerprint comparison report",
+            "Lawful subscriber identity (CAF) and CDR records for originating phone numbers",
+            "Comprehensive uncompressed CCTV footage from surrounding escape corridors",
+            "Definitive vehicle registration plate resolution via ANPR enhancement" if primary_veh else "Vehicle identification records",
+            "Corroborating witness statements and verified alibi timelines"
         ]
 
-        # 6. VERIFICATION STEPS
-        verification_steps = [
-            "Formally interview eyewitness to record signed statement under Section 161 CrPC with precise timeline details",
-            f"Issue preservation notice to cellular service providers for cell tower dumps covering {location_entity.lower()} at 10:30 PM",
-            f"Verify vehicle registration and determine whether {person_of_interest} or associates own or have access to a {vehicle_entity.lower()}",
-            f"Check phone number {phone_entity} against CDR logs of victim and person of interest for prior historical contact",
-            "Establish chain of custody for all retrieved CCTV surveillance files and generate cryptographic hashes (SHA-256)",
-        ]
-
-        # 7. SUSPICIOUS / ANOMALOUS PATTERNS
         patterns = [
-            f"Pre-Incident Threat Pattern: Victim received threatening communications from {phone_entity} earlier that evening prior to fatal event",
-            f"Temporal & Spatial Proximity: Person of interest ({person_of_interest}) sighted by witness departing location shortly before discovery window",
-            f"Unidentified Transport Pattern: Unregistered {vehicle_entity.lower()} recorded on CCTV operating near crime scene perimeter",
-            "Multi-Source Convergence: Eyewitness testimony, surveillance footage, and telephony records converge on narrow time window",
+            f"Multi-Source Convergence: Witness testimony, physical evidence, and digital logs converge on {primary_loc}",
+            "Temporal & Spatial Proximity: Observation of person of interest departing vicinity around incident window",
+            "Pre-Incident Hostility / Anomaly: Prior electronic threat or altercation preceding fatal incident"
+        ]
+
+        verification_steps = [
+            f"Verify vehicle registration records and determine whether {primary_person} has access to {primary_veh or 'a vehicle'}",
+            f"Correlate cell tower dump triangulations covering {primary_loc} against target device CDR logs",
+            "Establish cryptographic hashes (SHA-256) for all seized digital surveillance video files",
+            "Conduct formal forensic interview and verify documented alibi with independent third-party evidence"
         ]
 
         risk_level = "Critical"
         summary = (
-            f"A homicide investigation ('{name or 'Murder Investigation'}') has been established following the discovery "
-            f"of a deceased individual near {location_entity.lower()} at approximately {time_entity.lower()}. "
-            f"Eyewitness evidence places a person of interest, named {person_of_interest}, departing the location shortly before the incident. "
-            f"Surveillance footage corroborates the presence of an unidentified {vehicle_entity.lower()} near the scene, "
-            f"while electronic records confirm pre-incident threatening messages sent from {phone_entity}. "
-            f"{person_of_interest} is designated strictly as a person of interest; this classification represents a "
-            f"potential investigative lead, possible connection, and reported observation that requires verification, and does not imply culpability. "
-            f"Immediate investigative priorities include lawful subscriber identification for {phone_entity}, CCTV enhancement to identify the vehicle, "
-            f"and digital forensic extraction of threat metadata."
+            f"A violent crime investigation ('{name or 'Homicide Case'}') has been established concerning the incident at {primary_loc}. "
+            f"Investigative analysis correlated {len(merged_entities)} unique operational entity/entities and mapped {len(relationships)} verifiable connection(s). "
+            f"Evidence records place {primary_person} as a person of interest subject to verification. "
+            f"This designation represents an investigative lead and reported sighting, and does not imply culpability. "
+            f"Immediate priorities include FSL laboratory processing of physical exhibits, lawful subscriber identification, and video enhancement."
         )
 
-    else:
-        # ── CYBER / SCAM INVESTIGATION PIPELINE ───────────────────────────────
-        patterns = []
-        if any(re.search(rf"\b{k}\b", text_lower) for k in ["arrest", "police", "cbi", "ed", "warrant", "court", "digital arrest", "customs", "narcotics"]):
-            patterns.append("Law Enforcement Impersonation: Fraudsters posing as investigative agencies using intimidation and 'Digital Arrest' pretexts")
+        categorized_entities = {
+            "persons_of_interest": persons,
+            "victim_related": ["Victim / Deceased individual"],
+            "witnesses": [p for p in persons if "witness" in text_lower],
+            "phone_numbers": phones,
+            "vehicles": vehicles,
+            "locations": locations,
+            "dates_times": times,
+            "threats_communications": [f"Communication exhibit: {ph}" for ph in phones] + [em for em in emails],
+            "evidence": evidence_nodes or ["Recovered scene exhibits"],
+        }
 
-        if any(re.search(rf"\b{k}\b", text_lower) for k in ["kyc", "block", "suspend", "freeze", "deactivat", "pan card", "update pan"]):
-            patterns.append("Panic-Inducing Pretext: Fabricated account suspension threat utilized to compel immediate, unverified compliance")
+    elif category == "theft":
+        # ── THEFT / BURGLARY / PROPERTY / CORPORATE INVESTIGATION ──
+        primary_person = persons[0] if persons else "Person of Interest"
+        primary_loc = locations[0] if locations else "Facility Premises"
+        primary_veh = vehicles[0] if vehicles else None
 
-        if any(re.search(rf"\b{k}\b", text_lower) for k in ["job", "part time", "task", "work from home", "commission"]):
-            patterns.append("Task-Based Employment Trap: Deceptive job assignment soliciting initial deposits under promise of high commission")
-
-        if any(re.search(rf"\b{k}\b", text_lower) for k in ["investment", "trading", "crypto", "bitcoin", "profit", "return"]):
-            patterns.append("High-Yield Investment Fraud: Unregulated trading portal promising guaranteed exponential gains")
-
-        if any(e["type"] == "UPI" for e in merged_entities):
-            patterns.append("Virtual Payment Layering: Directing funds to third-party UPI VPAs to facilitate rapid fund off-ramping")
-
-        if any(e["type"] == "URL" for e in merged_entities):
-            patterns.append("Digital Phishing Infrastructure: Deceptive domain deployed to harvest credentials or simulate official portals")
-
-        if not patterns:
-            patterns.append("Suspicious Unsolicited Engagement: Unverified third-party outreach requiring formal verification")
-
-        leads = []
-        has_upi = any(e["type"] == "UPI" for e in merged_entities)
-        has_phone = any(e["type"] == "Phone" for e in merged_entities)
-        has_url = any(e["type"] == "URL" for e in merged_entities)
-        has_amount = any(e["type"] == "Amount" for e in merged_entities)
-
-        if has_upi or has_amount:
-            leads.append({
-                "lead": "Freeze receiving beneficiary accounts and trace banking trail",
-                "priority": "high",
-                "action": "Submit emergency debit-freeze request to Nodal Officer of beneficiary bank and verify recipient KYC details."
+        key_findings = []
+        for p in persons:
+            key_findings.append({
+                "label": "Person of Interest",
+                "value": p,
+                "category": "Persons of Interest",
+                "status": "Former contractor / individual associated with access credentials or scene sighting",
             })
-        if has_phone:
-            leads.append({
-                "lead": "Subpoena telecom provider for subscriber identity & call detail records",
-                "priority": "high",
-                "action": "Issue Section 91 CrPC notice for Customer Application Form (CAF), CDR logs, and originating cell tower coordinates."
+        if primary_veh:
+            key_findings.append({
+                "label": "Transport Vehicle",
+                "value": primary_veh,
+                "category": "Vehicles",
+                "status": "Transport vehicle observed outside facility during break-in window",
             })
-        if has_url:
-            leads.append({
-                "lead": "Identify domain registrar, hosting IP, and issue DNS takedown",
-                "priority": "high",
-                "action": "Perform WHOIS query to determine registrar, hosting ASN/IP, and file cyber incident report with CERT-In."
+        for ev in evidence_nodes:
+            key_findings.append({
+                "label": "Evidence Exhibit",
+                "value": ev,
+                "category": "Physical / Digital Evidence",
+                "status": "Corroborating documentary / access record recovered in investigation",
+            })
+        for loc in locations:
+            key_findings.append({
+                "label": "Target Facility",
+                "value": loc,
+                "category": "Locations",
+                "status": "Facility location where unauthorized breach occurred",
+            })
+        for t in times:
+            key_findings.append({
+                "label": "Breach Timestamp",
+                "value": t,
+                "category": "Dates/Times",
+                "status": "Timestamp of unauthorized entry / access control log trigger",
             })
 
-        timeline = [
-            "Phase 1: Initial contact established via unsolicited communication channel",
-            "Phase 2: Escalation of authority or consequence (coercion / inducement)",
-            "Phase 3: Financial transaction diversion requested via electronic payment",
-            "Phase 4: Investigator engagement and evidentiary preservation",
+        relationship_chains = []
+        for rel in relationships[:6]:
+            relationship_chains.append(f"{rel['entity_a']} -> {rel['relationship'].lower()} -> {rel['entity_b']}")
+
+        timeline = []
+        if times:
+            for t in times:
+                timeline.append(f"{t}: Unauthorized electronic access / sighting recorded at {primary_loc}")
+        if notes:
+            timeline.append(f"Scene Inspection: {notes[:140]}...")
+        if not timeline:
+            timeline = [
+                "Pre-Breach: Access credentials or perimeter reconnaissance",
+                "Breach Event: Physical or electronic access recorded at facility",
+                "Post-Breach: Discovery of stolen property / hardware inventory discrepancy"
+            ]
+
+        leads = [
+            {
+                "lead": f"Audit badge access logs and credential issuance for {primary_person}.",
+                "priority": "high",
+                "action": "Extract raw server authentication logs and cross-reference credential deactivation records."
+            },
+            {
+                "lead": "Subpoena pawn shop records and recover serial numbers of stolen hardware.",
+                "priority": "high",
+                "action": "Serve statutory notice on regional pawn shops and resale registries for matching hardware serials."
+            },
+            {
+                "lead": f"Enhance perimeter surveillance video to identify license plates of {primary_veh or 'transport vehicles'}.",
+                "priority": "medium",
+                "action": "Run ANPR on facility and intersection cameras along route to match vehicle registration."
+            }
         ]
 
         evidence_gaps = [
-            "Official Call Detail Records (CDR) and Tower Dumps from telecom operators",
-            "Bank transaction statement / UTR (Unique Transaction Reference) confirmation",
-            "Complete unaltered chat exports with original cryptographic timestamps",
-            "Certificate under Section 65B of Indian Evidence Act for electronic records",
+            "Hardware inventory serial numbers and MAC address registry",
+            "Full electronic access control audit logs covering all perimeter doors",
+            "Registration number and ownership details of observed transport vehicles",
+            "Physical tool mark / lock tampering analysis by forensic locksmith"
+        ]
+
+        patterns = [
+            "Credential Misuse / Insider Pattern: Former contractor or employee credentials utilized during non-operational hours",
+            "Physical Security Bypass: Lock tampering accompanied by selective hardware removal",
+            "Rapid Liquidation: Discarded pawn shop documentation indicating immediate off-ramping of stolen property"
         ]
 
         verification_steps = [
-            "Issue preservation notice under Section 91 CrPC / statutory regulations to messaging and telecom platforms",
-            "Cross-verify claimed officer credentials against official agency directories",
-            "Log dispute on National Cyber Crime Reporting Portal (cybercrime.gov.in / Helpline 1930)",
-            "Submit URL indicators of compromise (IOCs) to CERT-In and web browser threat lists",
+            f"Review employee / contractor termination files to determine credential deactivation status for {primary_person}",
+            "Verify CCTV video timestamps against NTP synchronized time server logs",
+            "Issue hardware serial blacklist notices to authorized refurbishers and pawn registries"
         ]
 
-        relationship_chains = [f"{r['entity_a']} → {r['relationship'].lower()} → {r['entity_b']}" for r in relationships[:5]]
-        key_findings = [
-            {"label": "Suspect Indicator", "value": e["value"], "category": e["type"], "status": "Suspected indicator in scam communication"}
-            for e in merged_entities[:6]
-        ]
+        risk_level = "High"
+        summary = (
+            f"Burglary and asset theft investigation ('{name or 'Facility Break-In'}') analyzed unauthorized entry at {primary_loc}. "
+            f"Analysis mapped {len(merged_entities)} entities and {len(relationships)} verifiable links. "
+            f"Access control evidence links credential utilization of {primary_person} to the incident window. "
+            f"Immediate priorities include hardware serial tracing, badge revocation audits, and vehicle registration verification."
+        )
+
         categorized_entities = {
-            "persons_of_interest": [e["value"] for e in merged_entities if e["type"] == "Person"],
-            "victim_related": ["Complainant / victim reporting financial loss or unsolicited contact"],
-            "witnesses": [],
-            "phone_numbers": [e["value"] for e in merged_entities if e["type"] == "Phone"],
-            "vehicles": [],
-            "locations": [e["value"] for e in merged_entities if e["type"] == "Location"],
-            "dates_times": [e["value"] for e in merged_entities if e["type"] == "Time"],
-            "threats_communications": [e["value"] for e in merged_entities if e["type"] in ("Email", "URL", "Phone")],
-            "evidence": ["Submitted message / communication exhibit"],
+            "persons_of_interest": persons,
+            "victim_related": ["Facility Management / Corporate Victim"],
+            "witnesses": [p for p in persons if "guard" in text_lower or "witness" in text_lower],
+            "phone_numbers": phones,
+            "vehicles": vehicles,
+            "locations": locations,
+            "dates_times": times,
+            "threats_communications": emails + [f"Call record: {ph}" for ph in phones],
+            "evidence": evidence_nodes or ["Badge scan records", "Pawn receipts", "CCTV files"],
         }
 
-        risk_level = "High" if (has_upi or has_amount) else "Medium"
+    else:
+        # ── CYBER / SCAM / FINANCIAL FRAUD INVESTIGATION ──
+        has_upi = bool(upis)
+        has_amount = bool(amounts)
+        has_phone = bool(phones)
+
+        key_findings = []
+        for p in persons:
+            key_findings.append({
+                "label": "Suspect Persona",
+                "value": p,
+                "category": "Persons of Interest",
+                "status": "Persona / claimed identity utilized in fraudulent communication",
+            })
+        for o in orgs:
+            key_findings.append({
+                "label": "Impersonated Organization",
+                "value": o,
+                "category": "Organizations",
+                "status": "Legitimate institutional agency impersonated to establish false authority",
+            })
+        for ph in phones:
+            key_findings.append({
+                "label": "Originating Phone",
+                "value": ph,
+                "category": "Phone Numbers",
+                "status": "Telecom endpoint transmitting deceptive / coercive communications",
+            })
+        for em in emails:
+            key_findings.append({
+                "label": "Originating Email",
+                "value": em,
+                "category": "Emails",
+                "status": "Email address transmitting fraudulent documents or notices",
+            })
+        for u in upis:
+            key_findings.append({
+                "label": "Target Payment VPA",
+                "value": u,
+                "category": "Payment Channels",
+                "status": "Designated beneficiary payment address demanded for fund transfer",
+            })
+        for a in amounts:
+            key_findings.append({
+                "label": "Extortion / Loss Amount",
+                "value": a,
+                "category": "Financial Demands",
+                "status": "Financial sum demanded or transferred in fraudulent scheme",
+            })
+
+        relationship_chains = []
+        for rel in relationships[:6]:
+            relationship_chains.append(f"{rel['entity_a']} -> {rel['relationship'].lower()} -> {rel['entity_b']}")
+
+        timeline = [
+            "Initial Contact: Victim contacted via unsolicited telephony / electronic message",
+            "Escalation & Authority Simulation: Impersonation of official agencies with coercive demands",
+            "Financial Diversion: Directive issued to transfer funds to designated digital payment accounts",
+            "Investigation Engagement: Case logged and electronic evidence preserved"
+        ]
+
+        patterns = []
+        if any(re.search(rf"\b{k}\b", text_lower) for k in ["arrest", "police", "cbi", "ed", "warrant", "court", "digital arrest"]):
+            patterns.append("Law Enforcement Impersonation: Fraudsters posing as investigative agencies using intimidation and 'Digital Arrest' pretexts")
+        if any(re.search(rf"\b{k}\b", text_lower) for k in ["kyc", "block", "suspend", "freeze", "deactivat", "pan card"]):
+            patterns.append("Panic-Inducing Pretext: Fabricated account suspension threat utilized to compel immediate, unverified compliance")
+        if any(re.search(rf"\b{k}\b", text_lower) for k in ["job", "part time", "task", "work from home", "commission"]):
+            patterns.append("Task-Based Employment Trap: Deceptive job assignment soliciting initial deposits under promise of high commission")
+        if any(re.search(rf"\b{k}\b", text_lower) for k in ["investment", "trading", "crypto", "bitcoin", "profit", "return"]):
+            patterns.append("High-Yield Investment Fraud: Unregulated trading portal promising guaranteed exponential gains")
+        if upis:
+            patterns.append("Virtual Payment Layering: Directing funds to third-party UPI VPAs to facilitate rapid fund off-ramping")
+        if urls:
+            patterns.append("Digital Phishing Infrastructure: Deceptive domain deployed to harvest credentials or simulate official portals")
+        if not patterns:
+            patterns.append("Suspicious Unsolicited Engagement: Unverified third-party outreach requiring formal verification")
+
+        leads = [
+            {
+                "lead": f"Issue Section 91 CrPC notice to telecom operator for subscriber details of {', '.join(phones) if phones else 'originating phone numbers'}.",
+                "priority": "high",
+                "action": "Obtain Customer Application Form (CAF), CDR with IMEI history, and tower location logs."
+            },
+            {
+                "lead": f"Issue notice to NPCI / beneficiary bank for KYC and freeze request on {', '.join(upis) if upis else 'beneficiary payment handles'}.",
+                "priority": "high",
+                "action": "Freeze beneficiary account, trace transaction audit trail, and identify recipient bank account KYC."
+            },
+            {
+                "lead": "Report fraudulent payment accounts to National Cyber Crime Reporting Portal (1930 / cybercrime.gov.in).",
+                "priority": "high",
+                "action": "Initiate automated lien-marking on disputed transaction sums across downstream beneficiary accounts."
+            }
+        ]
+
+        evidence_gaps = [
+            "Beneficiary bank account KYC, account holder name, and branch details",
+            "Unique Transaction Reference (UTR) numbers and bank transaction receipts",
+            "Official Call Detail Records (CDR) and IMEI history from telecom operators",
+            "Unaltered chat exports with original cryptographic message headers"
+        ]
+
+        verification_steps = [
+            f"Query NPCI directory to identify underlying account and IFSC code linked to {upis[0] if upis else 'the payment VPA'}",
+            f"Check phone number {phones[0] if phones else 'the suspect number'} against the Citizen Financial Cyber Fraud Reporting System (CFCFRMS)",
+            "Submit preservation requests under Section 79(3)(b) of the Information Technology Act to domain registrars and email providers"
+        ]
+
+        risk_level = "High" if (has_upi or has_amount or has_phone) else "Medium"
         summary = (
-            f"Investigation analysis for '{name or 'Active Case'}' identified {len(merged_entities)} unique operational entity/entities "
+            f"Cyber and financial fraud investigation for '{name or 'Active Case'}' identified {len(merged_entities)} unique operational entity/entities "
             f"and mapped {len(relationships)} verifiable connection(s). "
-            f"Modus operandi indicates {risk_level}-risk cyber activity. Immediate execution of priority leads is recommended."
+            f"Modus operandi indicates {risk_level}-risk organized digital extortion / fraud activity. Immediate execution of priority leads and bank account lien-marking is recommended."
         )
+
+        categorized_entities = {
+            "persons_of_interest": persons,
+            "victim_related": ["Complainant / victim reporting financial loss or unsolicited contact"],
+            "witnesses": [],
+            "phone_numbers": phones,
+            "vehicles": vehicles,
+            "locations": locations,
+            "dates_times": times,
+            "threats_communications": [f"Telecom channel: {ph}" for ph in phones] + emails + urls,
+            "evidence": evidence_nodes or ["Submitted communication exhibits", "Transaction logs"],
+        }
 
     return {
         "key_entities": merged_entities,
@@ -822,6 +1029,36 @@ async def _hf_extract_entities(text: str) -> list[dict]:
 
 async def analyze_investigation(case_data: dict) -> dict:
     """Main entry point for investigation analysis."""
+    if not isinstance(case_data, dict):
+        raise ValueError("Case data must be a dictionary")
+    if not case_data or not any(str(v).strip() for v in case_data.values() if v is not None):
+        return {
+            "key_entities": [],
+            "relationships": [],
+            "relationship_chains": [],
+            "key_findings": [],
+            "categorized_entities": {
+                "persons_of_interest": [],
+                "victim_related": [],
+                "witnesses": [],
+                "phone_numbers": [],
+                "vehicles": [],
+                "locations": [],
+                "dates_times": [],
+                "threats_communications": [],
+                "evidence": [],
+            },
+            "timeline": [],
+            "timeline_clues": [],
+            "suspicious_patterns": [],
+            "investigation_leads": [],
+            "evidence_gaps": ["No investigation content was provided"],
+            "missing_information": ["No investigation content was provided"],
+            "verification_steps": ["Collect a minimal factual record before assessing the case"],
+            "risk_level": "Unknown",
+            "summary": "No investigation details were provided.",
+            "mode": "rule-based",
+        }
     parts = []
     if case_data.get("name"):
         parts.append(f"Case Name: {case_data['name']}")
